@@ -322,17 +322,39 @@ function valAuto(f){
   if(!f.fechaCompra) e.fechaCompra="Requerido";
   return e;
 }
+// Fetch blue rate for a specific date from ArgentinaDatos historical API
+// Falls back to blueNow if not found (weekend/holiday tries up to 4 days back)
+async function fetchBlueForDate(dateStr){
+  if(!dateStr) return state.blueNow;
+  if(dateStr >= today()) return state.blueNow;
+  try {
+    const r=await fetch(`https://api.argentinadatos.com/v1/cotizaciones/dolares/blue/${dateStr}`);
+    if(r.ok){ const d=await r.json(); if(d.compra&&d.venta) return (d.compra+d.venta)/2; }
+    // weekend/holiday: try up to 4 days back
+    for(let i=1;i<=4;i++){
+      const prev=new Date(dateStr+"T12:00"); prev.setDate(prev.getDate()-i);
+      const ps=prev.toISOString().slice(0,10);
+      const r2=await fetch(`https://api.argentinadatos.com/v1/cotizaciones/dolares/blue/${ps}`);
+      if(r2.ok){ const d2=await r2.json(); if(d2.compra&&d2.venta) return (d2.compra+d2.venta)/2; }
+    }
+  } catch(_){}
+  return state.blueNow;
+}
+
 async function saveAutoAction(){
   const e=valAuto(state.autoF); if(Object.keys(e).length){setState({autoE:e});return;}
   const f=state.autoF;
   const base={...f,anio:+f.anio,km:+f.km,compraPesos:+f.compraPesos,dominio:normDom(f.dominio||"")};
   let newAutos;
   if(state.autoM.mode==="add"){
-    const novo={...base,id:state.nId,gastos:[],docs:emptyDocs(),mepCompra:state.blueNow,ventaPesos:null,mepVenta:null,fechaVenta:null};
+    // Fetch historical blue for the purchase date
+    const mepCompra = await fetchBlueForDate(base.fechaCompra);
+    const novo={...base,id:state.nId,gastos:[],docs:emptyDocs(),mepCompra,ventaPesos:null,mepVenta:null,fechaVenta:null};
     newAutos=[...state.autos,novo];
     await saveAuto(novo);
     await dbPut("meta",{key:"nId",value:state.nId+1});
     setState({autos:newAutos,nId:state.nId+1,autoM:null});
+    toast(`Blue del ${fmtDate(base.fechaCompra)}: ${fmtBlu(mepCompra)}`);
   } else {
     const updated=state.autos.map(a=>a.id===state.autoM.id?{...a,...base}:a);
     const u=updated.find(a=>a.id===state.autoM.id);
@@ -346,10 +368,13 @@ async function saveVentaAction(){
   if(!state.ventaF.ventaPesos||isNaN(+state.ventaF.ventaPesos)||+state.ventaF.ventaPesos<=0) e.ventaPesos="Monto inválido";
   if(!state.ventaF.fechaVenta) e.fechaVenta="Requerido";
   if(Object.keys(e).length){setState({ventaE:e});return;}
-  const updated=state.autos.map(a=>a.id===state.ventaM?{...a,ventaPesos:+state.ventaF.ventaPesos,mepVenta:state.blueNow,fechaVenta:state.ventaF.fechaVenta,estado:"Vendido"}:a);
+  // Fetch historical blue for the sale date
+  const mepVenta = await fetchBlueForDate(state.ventaF.fechaVenta);
+  const updated=state.autos.map(a=>a.id===state.ventaM?{...a,ventaPesos:+state.ventaF.ventaPesos,mepVenta,fechaVenta:state.ventaF.fechaVenta,estado:"Vendido"}:a);
   const u=updated.find(a=>a.id===state.ventaM);
   await saveAuto(u);
   setState({autos:updated,ventaM:null});
+  toast(`Blue del ${fmtDate(state.ventaF.fechaVenta)}: ${fmtBlu(mepVenta)}`);
 }
 
 function valGasto(f){
@@ -364,7 +389,8 @@ async function saveGastoAction(){
   const base={...state.gastoF,monto:+state.gastoF.monto};
   let updated;
   if(state.gastoM.mode==="add"){
-    const ng={...base,id:state.nGId,mepFecha:state.blueNow};
+    const mepFecha = await fetchBlueForDate(base.fecha);
+    const ng={...base,id:state.nGId,mepFecha};
     updated=state.autos.map(a=>a.id===state.gastoM.autoId?{...a,gastos:[...a.gastos,ng]}:a);
     await dbPut("meta",{key:"nGId",value:state.nGId+1});
     setState({autos:updated,nGId:state.nGId+1,gastoM:null});
@@ -379,7 +405,8 @@ async function saveGastoAction(){
 }
 async function saveDomGAction(){
   const e=valGasto(state.domGF); if(Object.keys(e).length){setState({domGE:e});return;}
-  const ng={...state.domGF,monto:+state.domGF.monto,id:state.nGId,mepFecha:state.blueNow};
+  const mepFechaD = await fetchBlueForDate(state.domGF.fecha);
+  const ng={...state.domGF,monto:+state.domGF.monto,id:state.nGId,mepFecha:mepFechaD};
   const updated=state.autos.map(a=>a.id===state.domAuto.id?{...a,gastos:[...a.gastos,ng]}:a);
   const u=updated.find(a=>a.id===state.domAuto.id);
   await saveAuto(u);
@@ -1688,7 +1715,204 @@ async function boot(){
   fetchBlue();
 }
 
-boot();
+// ─────────────────────────────────────────────────────────────────
+// AUTH: Face ID (WebAuthn) + PIN fallback
+// ─────────────────────────────────────────────────────────────────
+const AUTH_KEY  = "marcars_auth_v1";
+const CRED_KEY  = "marcars_cred_id";
+const PIN_KEY   = "marcars_pin_hash";
+
+async function sha256(str){
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+async function isRegistered(){
+  return !!(localStorage.getItem(CRED_KEY) || localStorage.getItem(PIN_KEY));
+}
+
+// Register Face ID credential
+async function registerFaceID(){
+  try {
+    const cred = await navigator.credentials.create({publicKey:{
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: {name:"Mar Cars"},
+      user: {id: new Uint8Array(16), name:"usuario", displayName:"Usuario"},
+      pubKeyCredParams: [{type:"public-key", alg:-7},{type:"public-key",alg:-257}],
+      authenticatorSelection: {authenticatorAttachment:"platform", userVerification:"required"},
+      timeout: 60000,
+    }});
+    localStorage.setItem(CRED_KEY, btoa(String.fromCharCode(...new Uint8Array(cred.rawId))));
+    return true;
+  } catch(_){ return false; }
+}
+
+// Verify Face ID
+async function verifyFaceID(){
+  const credId = localStorage.getItem(CRED_KEY);
+  if(!credId) return false;
+  try {
+    const rawId = Uint8Array.from(atob(credId), c=>c.charCodeAt(0));
+    await navigator.credentials.get({publicKey:{
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{type:"public-key", id:rawId}],
+      userVerification: "required",
+      timeout: 60000,
+    }});
+    return true;
+  } catch(_){ return false; }
+}
+
+function renderLockScreen(mode){
+  // mode: "unlock" | "setup"
+  document.body.innerHTML="";
+  const screen = document.createElement("div");
+  screen.style.cssText="min-height:100vh;background:#111010;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;";
+
+  const logo = document.createElement("img");
+  logo.src = document.querySelector ? "" : "";
+  // Use inline logo from state if available — just show text logo
+  const logoText = document.createElement("div");
+  logoText.style.cssText="color:#cc2020;font-size:28px;font-weight:900;letter-spacing:2px;margin-bottom:8px;";
+  logoText.textContent="MAR CARS";
+  const sub = document.createElement("div");
+  sub.style.cssText="color:#555;font-size:13px;margin-bottom:48px;";
+  sub.textContent="Inventario interno";
+  screen.appendChild(logoText);
+  screen.appendChild(sub);
+
+  const card = document.createElement("div");
+  card.style.cssText="background:#1e1a1a;border-radius:16px;padding:32px 28px;width:100%;max-width:320px;text-align:center;";
+
+  const title = document.createElement("div");
+  title.style.cssText="color:#fff;font-size:17px;font-weight:700;margin-bottom:8px;";
+  title.textContent = mode==="setup" ? "Configurar acceso" : "Acceso a Mar Cars";
+  card.appendChild(title);
+
+  const desc = document.createElement("div");
+  desc.style.cssText="color:#888;font-size:13px;margin-bottom:28px;line-height:1.5;";
+  desc.textContent = mode==="setup"
+    ? "Configurá Face ID y un PIN de respaldo para proteger tu información."
+    : "Desbloqueá con Face ID o ingresá tu PIN.";
+  card.appendChild(desc);
+
+  // Face ID button
+  const hasFaceID = !!localStorage.getItem(CRED_KEY);
+  if(hasFaceID || mode==="setup"){
+    const faceBtn = document.createElement("button");
+    faceBtn.style.cssText="width:100%;background:#cc2020;color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:16px;display:flex;align-items:center;justify-content:center;gap:8px;";
+    faceBtn.innerHTML = mode==="setup" ? "🔐 Activar Face ID" : "🔐 Usar Face ID";
+    faceBtn.onclick = async () => {
+      faceBtn.textContent="Verificando…";
+      faceBtn.disabled=true;
+      if(mode==="setup"){
+        const ok = await registerFaceID();
+        if(ok){ msg.textContent="✅ Face ID activado"; msg.style.color="#28a745"; }
+        else  { msg.textContent="No se pudo activar Face ID en este dispositivo"; msg.style.color="#cc2020"; }
+        faceBtn.disabled=false;
+        faceBtn.innerHTML="🔐 Activar Face ID";
+      } else {
+        const ok = await verifyFaceID();
+        if(ok){ unlockApp(); }
+        else  { msg.textContent="Face ID no reconocido, usá tu PIN"; msg.style.color="#cc2020"; faceBtn.disabled=false; faceBtn.innerHTML="🔐 Usar Face ID"; }
+      }
+    };
+    card.appendChild(faceBtn);
+  }
+
+  // PIN input
+  const pinLabel = document.createElement("div");
+  pinLabel.style.cssText="color:#888;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:8px;text-align:left;";
+  pinLabel.textContent = mode==="setup" ? "Crear PIN (4-6 dígitos)" : "PIN";
+  card.appendChild(pinLabel);
+
+  const pinInp = document.createElement("input");
+  pinInp.type="password"; pinInp.inputMode="numeric"; pinInp.maxLength=6;
+  pinInp.placeholder="······";
+  pinInp.style.cssText="width:100%;padding:12px 14px;border-radius:8px;border:1px solid #333;background:#111;color:#fff;font-size:20px;text-align:center;letter-spacing:6px;outline:none;box-sizing:border-box;margin-bottom:12px;";
+  card.appendChild(pinInp);
+
+  if(mode==="setup"){
+    const pinInp2 = document.createElement("input");
+    pinInp2.type="password"; pinInp2.inputMode="numeric"; pinInp2.maxLength=6;
+    pinInp2.placeholder="Repetir PIN";
+    pinInp2.style.cssText=pinInp.style.cssText+"margin-bottom:16px;";
+    card.appendChild(pinInp2);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.style.cssText="width:100%;background:#333;color:#fff;border:none;border-radius:10px;padding:13px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:12px;";
+    saveBtn.textContent="Guardar PIN";
+    saveBtn.onclick = async () => {
+      const p1=pinInp.value, p2=pinInp2.value;
+      if(p1.length<4){msg.textContent="El PIN debe tener al menos 4 dígitos";msg.style.color="#cc2020";return;}
+      if(p1!==p2){msg.textContent="Los PINs no coinciden";msg.style.color="#cc2020";return;}
+      const hash = await sha256(p1);
+      localStorage.setItem(PIN_KEY, hash);
+      msg.textContent="✅ PIN guardado. Ya podés cerrar esta pantalla.";
+      msg.style.color="#28a745";
+    };
+    card.appendChild(saveBtn);
+
+    const doneBtn = document.createElement("button");
+    doneBtn.style.cssText="width:100%;background:#cc2020;color:#fff;border:none;border-radius:10px;padding:13px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:12px;";
+    doneBtn.textContent="Continuar →";
+    doneBtn.onclick = () => {
+      if(!localStorage.getItem(PIN_KEY) && !localStorage.getItem(CRED_KEY)){
+        msg.textContent="Configurá al menos un método de acceso";msg.style.color="#cc2020";return;
+      }
+      unlockApp();
+    };
+    card.appendChild(doneBtn);
+  } else {
+    const pinBtn = document.createElement("button");
+    pinBtn.style.cssText="width:100%;background:#333;color:#fff;border:none;border-radius:10px;padding:13px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:12px;";
+    pinBtn.textContent="Entrar con PIN";
+    pinBtn.onclick = async () => {
+      const hash = await sha256(pinInp.value);
+      if(hash === localStorage.getItem(PIN_KEY)){ unlockApp(); }
+      else { msg.textContent="PIN incorrecto"; msg.style.color="#cc2020"; pinInp.value=""; }
+    };
+    pinInp.addEventListener("keydown", e=>{ if(e.key==="Enter") pinBtn.click(); });
+    card.appendChild(pinBtn);
+  }
+
+  const msg = document.createElement("div");
+  msg.style.cssText="font-size:12px;min-height:16px;margin-top:4px;";
+  card.appendChild(msg);
+
+  screen.appendChild(card);
+  document.body.appendChild(screen);
+
+  // Auto-trigger Face ID on unlock screen
+  if(mode==="unlock" && hasFaceID){
+    setTimeout(async()=>{
+      const ok = await verifyFaceID();
+      if(ok) unlockApp();
+    }, 400);
+  }
+}
+
+function unlockApp(){
+  document.body.innerHTML='<div id="app"></div><div id="toast"></div>';
+  // Re-apply toast style
+  const style=document.createElement("style");
+  style.textContent="#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a2e;color:#fff;padding:10px 20px;border-radius:99px;font-size:13px;font-weight:600;z-index:999;opacity:0;transition:opacity 0.3s;pointer-events:none}#toast.show{opacity:1}";
+  document.head.appendChild(style);
+  boot();
+}
+
+async function initAuth(){
+  const registered = await isRegistered();
+  if(!registered){
+    // First launch: setup screen
+    renderLockScreen("setup");
+  } else {
+    renderLockScreen("unlock");
+  }
+}
+
+initAuth();
+
 </script>
 </body>
 </html>
